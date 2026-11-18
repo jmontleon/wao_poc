@@ -28,7 +28,7 @@ metadata:
     operatorframework.io/suggested-namespace-template: '{"kind":"Namespace","apiVersion":"v1","metadata":{"name":"openshift-workload-availability","annotations":{"openshift.io/node-selector":""}}}'
     repository: https://github.com/jwmatthews/wao_poc
     support: Proof of concept, unsupported
-  name: workload-availability-operator.v0.0.0
+  name: workload-availability-operator.v5.1.0
   namespace: placeholder
 spec:
   apiservicedefinitions: {}
@@ -535,4 +535,4 @@ spec:
       name: mdr-manager
     - image: quay.io/medik8s/node-maintenance-operator@sha256:d0ae352a382193ed587b9fe6c4d1b24586ca007f98417e8ebae33b31f540c235
       name: nmo-manager
-  version: 0.0.0
+  version: 5.1.0
