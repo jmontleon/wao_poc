@@ -7,7 +7,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 export REG="${REG:-quay.io/jwmatthews}"
-export VERSION="${VERSION:-0.1.0-20261031b}"
+export VERSION="${VERSION:-5.1.0}"
 export IMG="${IMG:-$REG/workload-availability-operator:v$VERSION}"
 export BUNDLE_IMG="${BUNDLE_IMG:-$REG/workload-availability-operator-bundle:v$VERSION}"
 export CATALOG_IMG="${CATALOG_IMG:-$REG/workload-availability-operator-catalog:v$VERSION}"
