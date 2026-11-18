@@ -29,6 +29,10 @@ type Definition struct {
 	// of these kinds that exist anywhere in the cluster while the component is Disabled are
 	// no longer reconciled and are reported as retained.
 	ManagedKinds []ResourceKind
+	// AgentDaemonSetSelector matches, by pre-existing operand labels, the runtime agent
+	// DaemonSet(s) a component creates in the install namespace. When the component is
+	// Disabled these DaemonSets are deleted. Empty for components with no node agent.
+	AgentDaemonSetSelector map[string]string
 }
 
 // All returns the POC operand set in reconcile order.
