@@ -56,7 +56,7 @@ type WorkloadAvailabilityConfigReconciler struct {
 // +kubebuilder:rbac:groups=workloadavailability.medik8s.io,resources=workloadavailabilityconfigs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=workloadavailability.medik8s.io,resources=workloadavailabilityconfigs/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=apps,resources=daemonsets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps,resources=daemonsets,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups="",resources=services;configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingwebhookconfigurations;mutatingwebhookconfigurations,verbs=get;list;watch;create;update;patch;delete
@@ -261,6 +261,18 @@ func (r *WorkloadAvailabilityConfigReconciler) ensureDisabled(ctx context.Contex
 		}
 		if err := r.Delete(ctx, existing); err != nil && !apierrors.IsNotFound(err) {
 			return st, fmt.Errorf("delete %s/%s: %w", o.GetKind(), o.GetName(), err)
+		}
+	}
+	if len(def.AgentDaemonSetSelector) > 0 {
+		dsl := &appsv1.DaemonSetList{}
+		if err := r.List(ctx, dsl, client.InNamespace(r.Namespace), client.MatchingLabels(def.AgentDaemonSetSelector)); err != nil {
+			return st, err
+		}
+		for i := range dsl.Items {
+			ds := &dsl.Items[i]
+			if err := r.Delete(ctx, ds); err != nil && !apierrors.IsNotFound(err) {
+				return st, fmt.Errorf("delete DaemonSet %s/%s: %w", ds.Namespace, ds.Name, err)
+			}
 		}
 	}
 	retained, err := r.retainedResources(ctx, def)

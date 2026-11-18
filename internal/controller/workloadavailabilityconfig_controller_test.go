@@ -486,39 +486,78 @@ var _ = Describe("WorkloadAvailabilityConfig controller", Ordered, func() {
 		}).Should(Succeed())
 	})
 
-	It("reports DisableIncomplete when SNR agents survive a manager-level disable", func() {
-		// Simulate what the SNR manager creates at runtime. Do it while SNR is Disabled: once enabled,
-		// SNR's Fail-policy webhooks are registered and envtest has no backend to answer them.
+	It("deletes the SNR agent DaemonSet on disable but keeps reporting the config CR", func() {
 		cfg := &unstructured.Unstructured{}
 		cfg.SetGroupVersionKind(schema.GroupVersionKind{Group: "self-node-remediation.medik8s.io", Version: "v1alpha1", Kind: "SelfNodeRemediationConfig"})
 		cfg.SetName("self-node-remediation-config")
 		cfg.SetNamespace(ns)
 		Expect(k8sClient.Create(ctx, cfg)).To(Succeed())
 		ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "self-node-remediation-ds", Namespace: ns,
-			OwnerReferences: []metav1.OwnerReference{{APIVersion: "self-node-remediation.medik8s.io/v1alpha1", Kind: "SelfNodeRemediationConfig", Name: cfg.GetName(), UID: cfg.GetUID(), Controller: ptr.To(true)}}},
-			Spec: appsv1.DaemonSetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "snr-agent"}},
-				Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "snr-agent"}},
+			Labels: map[string]string{"k8s-app": "self-node-remediation"}},
+			Spec: appsv1.DaemonSetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "self-node-remediation"}},
+				Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app.kubernetes.io/name": "self-node-remediation"}},
 					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "agent", Image: "example.test/agent"}}}}}}
 		Expect(k8sClient.Create(ctx, ds)).To(Succeed())
+		// A foreign DaemonSet with a different label must survive.
+		foreign := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "unrelated-ds", Namespace: ns,
+			Labels: map[string]string{"app": "something-else"}},
+			Spec: appsv1.DaemonSetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "something-else"}},
+				Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "something-else"}},
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "x", Image: "example.test/x"}}}}}}
+		Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
 
 		setEnabled(ctx, v1alpha1.ComponentKeySelfNodeRemediation, true)
 		Eventually(func(g Gomega) {
 			g.Expect(component(getWAC(ctx), v1alpha1.ComponentKeySelfNodeRemediation).Phase).To(Equal(v1alpha1.ComponentPhaseProgressing))
 		}).Should(Succeed())
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "self-node-remediation-controller-manager"}, &appsv1.Deployment{})).To(Succeed())
 
 		setEnabled(ctx, v1alpha1.ComponentKeySelfNodeRemediation, false)
 		Eventually(func(g Gomega) {
-			w := getWAC(ctx)
-			c := component(w, v1alpha1.ComponentKeySelfNodeRemediation)
+			g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(ds), &appsv1.DaemonSet{}))).To(BeTrue())
+			c := component(getWAC(ctx), v1alpha1.ComponentKeySelfNodeRemediation)
 			g.Expect(c.Phase).To(Equal(v1alpha1.ComponentPhaseDisableIncomplete))
-			g.Expect(strings.Join(c.RetainedResources, "\n")).To(ContainSubstring("DaemonSet " + ns + "/self-node-remediation-ds"))
 			g.Expect(strings.Join(c.RetainedResources, "\n")).To(ContainSubstring("SelfNodeRemediationConfig " + ns + "/self-node-remediation-config"))
-			g.Expect(meta.FindStatusCondition(w.Status.Conditions, v1alpha1.ConditionAvailable).Reason).To(Equal("DisableIncomplete"))
+			g.Expect(strings.Join(c.RetainedResources, "\n")).NotTo(ContainSubstring("self-node-remediation-ds"))
 		}).Should(Succeed())
-		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "self-node-remediation-controller-manager"}, &appsv1.Deployment{}))).To(BeTrue())
-		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ds), ds)).To(Succeed(), "WAO must not delete the agent DaemonSet")
-		Expect(k8sClient.Delete(ctx, ds)).To(Succeed())
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(foreign), foreign)).To(Succeed(), "foreign DaemonSet must survive")
+		Expect(k8sClient.Delete(ctx, foreign)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, cfg)).To(Succeed())
+	})
+
+	It("deletes both SBR agent DaemonSets on disable but keeps reporting the config CR", func() {
+		cfg := &unstructured.Unstructured{}
+		cfg.SetGroupVersionKind(schema.GroupVersionKind{Group: "storage-based-remediation.medik8s.io", Version: "v1alpha1", Kind: "StorageBasedRemediationConfig"})
+		cfg.SetName("storage-based-remediation-config")
+		cfg.SetNamespace(ns)
+		Expect(k8sClient.Create(ctx, cfg)).To(Succeed())
+		dsA := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "sbr-agent-a", Namespace: ns,
+			Labels: map[string]string{"app": "sbr-agent"}},
+			Spec: appsv1.DaemonSetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "sbr-agent-a"}},
+				Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app.kubernetes.io/name": "sbr-agent-a"}},
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "agent", Image: "example.test/sbr-agent"}}}}}}
+		Expect(k8sClient.Create(ctx, dsA)).To(Succeed())
+		dsB := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "sbr-agent-b", Namespace: ns,
+			Labels: map[string]string{"app": "sbr-agent"}},
+			Spec: appsv1.DaemonSetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "sbr-agent-b"}},
+				Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app.kubernetes.io/name": "sbr-agent-b"}},
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "agent", Image: "example.test/sbr-agent"}}}}}}
+		Expect(k8sClient.Create(ctx, dsB)).To(Succeed())
+
+		setEnabled(ctx, v1alpha1.ComponentKeyStorageBasedRemediation, true)
+		Eventually(func(g Gomega) {
+			g.Expect(component(getWAC(ctx), v1alpha1.ComponentKeyStorageBasedRemediation).Phase).To(Equal(v1alpha1.ComponentPhaseProgressing))
+		}).Should(Succeed())
+
+		setEnabled(ctx, v1alpha1.ComponentKeyStorageBasedRemediation, false)
+		Eventually(func(g Gomega) {
+			g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(dsA), &appsv1.DaemonSet{}))).To(BeTrue())
+			g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(dsB), &appsv1.DaemonSet{}))).To(BeTrue())
+			c := component(getWAC(ctx), v1alpha1.ComponentKeyStorageBasedRemediation)
+			g.Expect(c.Phase).To(Equal(v1alpha1.ComponentPhaseDisableIncomplete))
+			g.Expect(strings.Join(c.RetainedResources, "\n")).To(ContainSubstring("StorageBasedRemediationConfig " + ns + "/storage-based-remediation-config"))
+			g.Expect(strings.Join(c.RetainedResources, "\n")).NotTo(ContainSubstring("sbr-agent-a"))
+			g.Expect(strings.Join(c.RetainedResources, "\n")).NotTo(ContainSubstring("sbr-agent-b"))
+		}).Should(Succeed())
 		Expect(k8sClient.Delete(ctx, cfg)).To(Succeed())
 	})
 
