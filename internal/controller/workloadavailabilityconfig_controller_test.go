@@ -493,7 +493,9 @@ var _ = Describe("WorkloadAvailabilityConfig controller", Ordered, func() {
 		cfg.SetNamespace(ns)
 		Expect(k8sClient.Create(ctx, cfg)).To(Succeed())
 		ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "self-node-remediation-ds", Namespace: ns,
-			Labels: map[string]string{"k8s-app": "self-node-remediation"}},
+			Labels: map[string]string{"k8s-app": "self-node-remediation"},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "self-node-remediation.medik8s.io/v1alpha1", Kind: "SelfNodeRemediationConfig",
+				Name: cfg.GetName(), UID: cfg.GetUID(), Controller: ptr.To(true)}}},
 			Spec: appsv1.DaemonSetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "self-node-remediation"}},
 				Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app.kubernetes.io/name": "self-node-remediation"}},
 					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "agent", Image: "example.test/agent"}}}}}}
@@ -510,9 +512,13 @@ var _ = Describe("WorkloadAvailabilityConfig controller", Ordered, func() {
 		Eventually(func(g Gomega) {
 			g.Expect(component(getWAC(ctx), v1alpha1.ComponentKeySelfNodeRemediation).Phase).To(Equal(v1alpha1.ComponentPhaseProgressing))
 		}).Should(Succeed())
+		Eventually(func() error {
+			return k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "self-node-remediation-controller-manager"}, &appsv1.Deployment{})
+		}).Should(Succeed())
 
 		setEnabled(ctx, v1alpha1.ComponentKeySelfNodeRemediation, false)
 		Eventually(func(g Gomega) {
+			g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "self-node-remediation-controller-manager"}, &appsv1.Deployment{}))).To(BeTrue())
 			g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(ds), &appsv1.DaemonSet{}))).To(BeTrue())
 			c := component(getWAC(ctx), v1alpha1.ComponentKeySelfNodeRemediation)
 			g.Expect(c.Phase).To(Equal(v1alpha1.ComponentPhaseDisableIncomplete))
@@ -531,13 +537,17 @@ var _ = Describe("WorkloadAvailabilityConfig controller", Ordered, func() {
 		cfg.SetNamespace(ns)
 		Expect(k8sClient.Create(ctx, cfg)).To(Succeed())
 		dsA := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "sbr-agent-a", Namespace: ns,
-			Labels: map[string]string{"app": "sbr-agent"}},
+			Labels: map[string]string{"app": "sbr-agent", "managed-by": "sbr-operator"},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "storage-based-remediation.medik8s.io/v1alpha1", Kind: "StorageBasedRemediationConfig",
+				Name: cfg.GetName(), UID: cfg.GetUID(), Controller: ptr.To(true)}}},
 			Spec: appsv1.DaemonSetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "sbr-agent-a"}},
 				Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app.kubernetes.io/name": "sbr-agent-a"}},
 					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "agent", Image: "example.test/sbr-agent"}}}}}}
 		Expect(k8sClient.Create(ctx, dsA)).To(Succeed())
 		dsB := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "sbr-agent-b", Namespace: ns,
-			Labels: map[string]string{"app": "sbr-agent"}},
+			Labels: map[string]string{"app": "sbr-agent", "managed-by": "sbr-operator"},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "storage-based-remediation.medik8s.io/v1alpha1", Kind: "StorageBasedRemediationConfig",
+				Name: cfg.GetName(), UID: cfg.GetUID(), Controller: ptr.To(true)}}},
 			Spec: appsv1.DaemonSetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "sbr-agent-b"}},
 				Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app.kubernetes.io/name": "sbr-agent-b"}},
 					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "agent", Image: "example.test/sbr-agent"}}}}}}

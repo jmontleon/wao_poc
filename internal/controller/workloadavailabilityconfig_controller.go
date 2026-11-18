@@ -283,7 +283,7 @@ func (r *WorkloadAvailabilityConfigReconciler) ensureDisabled(ctx context.Contex
 	var msgs []string
 	if len(retained) > 0 {
 		st.Phase = v1alpha1.ComponentPhaseDisableIncomplete
-		msgs = append(msgs, "manager removed; agents, configs or native objects it would reconcile remain and need the component's own procedure")
+		msgs = append(msgs, "manager removed; configs or native objects it would reconcile remain and need the component's own procedure")
 	}
 	if len(skipped) > 0 {
 		msgs = append(msgs, fmt.Sprintf("left foreign objects untouched: %v", skipped))
@@ -298,9 +298,10 @@ func (r *WorkloadAvailabilityConfigReconciler) ensureDisabled(ctx context.Contex
 	return st, nil
 }
 
-// retainedResources lists what outlives a manager-level disable: agent DaemonSets owned by
-// component configs and those configs (install namespace), plus native objects of the
-// component's managed kinds anywhere in the cluster.
+// retainedResources lists what outlives a manager-level disable: component config CRs
+// (install namespace) with agent DaemonSets still owned by them, plus native objects of the
+// component's managed kinds anywhere in the cluster. SNR/SBR agent DaemonSets are deleted on
+// disable via AgentDaemonSetSelector, so they no longer appear here.
 func (r *WorkloadAvailabilityConfigReconciler) retainedResources(ctx context.Context, def components.Definition) ([]string, error) {
 	var out []string
 	if len(def.AgentOwners) > 0 {
