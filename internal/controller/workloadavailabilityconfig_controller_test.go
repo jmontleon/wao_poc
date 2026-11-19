@@ -22,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"github.com/medik8s/workload-availability-operator/api/v1alpha1"
 	"github.com/medik8s/workload-availability-operator/internal/components"
@@ -129,6 +130,32 @@ func setEnabled(ctx context.Context, key string, enabled bool) {
 		}
 		return k8sClient.Update(ctx, w)
 	}).Should(Succeed())
+}
+
+// envtest has no garbage collector. Complete foreground deletion explicitly after
+// checking that WAO requested it, simulating the removal of dependent pods.
+func completeForegroundDeletion(ctx context.Context, obj client.Object) {
+	Eventually(func(g Gomega) {
+		g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(obj), obj)).To(Succeed())
+		g.Expect(obj.GetDeletionTimestamp()).NotTo(BeNil())
+		g.Expect(obj.GetFinalizers()).To(ContainElement(metav1.FinalizerDeleteDependents))
+	}).Should(Succeed())
+	Eventually(func() error {
+		if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+			return err
+		}
+		controllerutil.RemoveFinalizer(obj, metav1.FinalizerDeleteDependents)
+		return k8sClient.Update(ctx, obj)
+	}).Should(Succeed())
+	Eventually(func() bool {
+		return apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(obj), obj))
+	}).Should(BeTrue())
+}
+
+func completeManagerDeletion(ctx context.Context, def components.Definition) {
+	if len(def.AgentDaemonSetSelector) > 0 {
+		completeForegroundDeletion(ctx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: def.ManagerDeployment, Namespace: ns}})
+	}
 }
 
 var _ = Describe("WorkloadAvailabilityConfig controller", Ordered, func() {
@@ -257,6 +284,7 @@ var _ = Describe("WorkloadAvailabilityConfig controller", Ordered, func() {
 		}
 		for _, def := range components.All() {
 			setEnabled(ctx, def.Key, false)
+			completeManagerDeletion(ctx, def)
 			setResources(ctx, def.Key, nil)
 		}
 		Eventually(func(g Gomega) {
@@ -362,6 +390,7 @@ var _ = Describe("WorkloadAvailabilityConfig controller", Ordered, func() {
 		generation := getDeployment(ctx, name).Generation
 		Consistently(func() int64 { return getDeployment(ctx, name).Generation }, 2*time.Second, 100*time.Millisecond).Should(Equal(generation))
 		setEnabled(ctx, v1alpha1.ComponentKeyStorageBasedRemediation, false)
+		completeManagerDeletion(ctx, components.SBR())
 		Eventually(func() bool {
 			return apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "sbr-operator-controller-manager"}, &appsv1.Deployment{}))
 		}).Should(BeTrue())
@@ -401,6 +430,7 @@ var _ = Describe("WorkloadAvailabilityConfig controller", Ordered, func() {
 		}).Should(Succeed())
 		setResources(ctx, v1alpha1.ComponentKeyStorageBasedRemediation, bad)
 		setEnabled(ctx, v1alpha1.ComponentKeyStorageBasedRemediation, false)
+		completeManagerDeletion(ctx, components.SBR())
 		Eventually(func(g Gomega) {
 			g.Expect(component(getWAC(ctx), v1alpha1.ComponentKeyStorageBasedRemediation).Phase).To(Equal(v1alpha1.ComponentPhaseDisabled))
 			g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &appsv1.Deployment{}))).To(BeTrue())
@@ -470,6 +500,9 @@ var _ = Describe("WorkloadAvailabilityConfig controller", Ordered, func() {
 		}
 		for _, key := range v1alpha1.AllComponentKeys {
 			setEnabled(ctx, key, false)
+			def, ok := components.ByKey(key)
+			Expect(ok).To(BeTrue())
+			completeManagerDeletion(ctx, def)
 		}
 		Eventually(func(g Gomega) {
 			for _, def := range components.All() {
@@ -487,11 +520,19 @@ var _ = Describe("WorkloadAvailabilityConfig controller", Ordered, func() {
 	})
 
 	It("deletes the SNR agent DaemonSet on disable but keeps reporting the config CR", func() {
+		// Create the config before enabling: envtest has no operand webhook server.
 		cfg := &unstructured.Unstructured{}
 		cfg.SetGroupVersionKind(schema.GroupVersionKind{Group: "self-node-remediation.medik8s.io", Version: "v1alpha1", Kind: "SelfNodeRemediationConfig"})
 		cfg.SetName("self-node-remediation-config")
 		cfg.SetNamespace(ns)
 		Expect(k8sClient.Create(ctx, cfg)).To(Succeed())
+		setEnabled(ctx, v1alpha1.ComponentKeySelfNodeRemediation, true)
+		Eventually(func(g Gomega) {
+			g.Expect(component(getWAC(ctx), v1alpha1.ComponentKeySelfNodeRemediation).Phase).To(Equal(v1alpha1.ComponentPhaseProgressing))
+		}).Should(Succeed())
+		Eventually(func() error {
+			return k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "self-node-remediation-controller-manager"}, &appsv1.Deployment{})
+		}).Should(Succeed())
 		ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "self-node-remediation-ds", Namespace: ns,
 			Labels: map[string]string{"k8s-app": "self-node-remediation"},
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: "self-node-remediation.medik8s.io/v1alpha1", Kind: "SelfNodeRemediationConfig",
@@ -508,15 +549,25 @@ var _ = Describe("WorkloadAvailabilityConfig controller", Ordered, func() {
 					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "x", Image: "example.test/x"}}}}}}
 		Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
 
-		setEnabled(ctx, v1alpha1.ComponentKeySelfNodeRemediation, true)
-		Eventually(func(g Gomega) {
-			g.Expect(component(getWAC(ctx), v1alpha1.ComponentKeySelfNodeRemediation).Phase).To(Equal(v1alpha1.ComponentPhaseProgressing))
-		}).Should(Succeed())
-		Eventually(func() error {
-			return k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "self-node-remediation-controller-manager"}, &appsv1.Deployment{})
-		}).Should(Succeed())
-
 		setEnabled(ctx, v1alpha1.ComponentKeySelfNodeRemediation, false)
+		Eventually(func(g Gomega) {
+			manager := getDeployment(ctx, components.SNR().ManagerDeployment)
+			g.Expect(manager.DeletionTimestamp).NotTo(BeNil())
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ds), ds)).To(Succeed())
+			g.Expect(ds.DeletionTimestamp).To(BeNil(), "agents must survive while the manager is terminating")
+			c := component(getWAC(ctx), v1alpha1.ComponentKeySelfNodeRemediation)
+			g.Expect(c.Phase).To(Equal(v1alpha1.ComponentPhaseProgressing))
+			g.Expect(c.Message).To(ContainSubstring("manager"))
+		}).Should(Succeed())
+		completeManagerDeletion(ctx, components.SNR())
+		Eventually(func(g Gomega) {
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ds), ds)).To(Succeed())
+			g.Expect(ds.DeletionTimestamp).NotTo(BeNil())
+			c := component(getWAC(ctx), v1alpha1.ComponentKeySelfNodeRemediation)
+			g.Expect(c.Phase).To(Equal(v1alpha1.ComponentPhaseProgressing))
+			g.Expect(c.Message).To(ContainSubstring("agent DaemonSets"))
+		}).Should(Succeed())
+		completeForegroundDeletion(ctx, ds)
 		Eventually(func(g Gomega) {
 			g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "self-node-remediation-controller-manager"}, &appsv1.Deployment{}))).To(BeTrue())
 			g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(ds), &appsv1.DaemonSet{}))).To(BeTrue())
@@ -536,6 +587,10 @@ var _ = Describe("WorkloadAvailabilityConfig controller", Ordered, func() {
 		cfg.SetName("storage-based-remediation-config")
 		cfg.SetNamespace(ns)
 		Expect(k8sClient.Create(ctx, cfg)).To(Succeed())
+		setEnabled(ctx, v1alpha1.ComponentKeyStorageBasedRemediation, true)
+		Eventually(func(g Gomega) {
+			g.Expect(component(getWAC(ctx), v1alpha1.ComponentKeyStorageBasedRemediation).Phase).To(Equal(v1alpha1.ComponentPhaseProgressing))
+		}).Should(Succeed())
 		dsA := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "sbr-agent-a", Namespace: ns,
 			Labels: map[string]string{"app": "sbr-agent", "managed-by": "sbr-operator"},
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: "storage-based-remediation.medik8s.io/v1alpha1", Kind: "StorageBasedRemediationConfig",
@@ -553,12 +608,24 @@ var _ = Describe("WorkloadAvailabilityConfig controller", Ordered, func() {
 					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "agent", Image: "example.test/sbr-agent"}}}}}}
 		Expect(k8sClient.Create(ctx, dsB)).To(Succeed())
 
-		setEnabled(ctx, v1alpha1.ComponentKeyStorageBasedRemediation, true)
-		Eventually(func(g Gomega) {
-			g.Expect(component(getWAC(ctx), v1alpha1.ComponentKeyStorageBasedRemediation).Phase).To(Equal(v1alpha1.ComponentPhaseProgressing))
-		}).Should(Succeed())
-
 		setEnabled(ctx, v1alpha1.ComponentKeyStorageBasedRemediation, false)
+		Eventually(func(g Gomega) {
+			manager := getDeployment(ctx, components.SBR().ManagerDeployment)
+			g.Expect(manager.DeletionTimestamp).NotTo(BeNil())
+			for _, ds := range []*appsv1.DaemonSet{dsA, dsB} {
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ds), ds)).To(Succeed())
+				g.Expect(ds.DeletionTimestamp).To(BeNil(), "agents must survive while the manager is terminating")
+			}
+		}).Should(Succeed())
+		completeManagerDeletion(ctx, components.SBR())
+		completeForegroundDeletion(ctx, dsA)
+		Eventually(func(g Gomega) {
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(dsB), dsB)).To(Succeed())
+			g.Expect(dsB.DeletionTimestamp).NotTo(BeNil())
+			c := component(getWAC(ctx), v1alpha1.ComponentKeyStorageBasedRemediation)
+			g.Expect(c.Phase).To(Equal(v1alpha1.ComponentPhaseProgressing), "all agent DaemonSets must finish terminating")
+		}).Should(Succeed())
+		completeForegroundDeletion(ctx, dsB)
 		Eventually(func(g Gomega) {
 			g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(dsA), &appsv1.DaemonSet{}))).To(BeTrue())
 			g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(dsB), &appsv1.DaemonSet{}))).To(BeTrue())
@@ -633,7 +700,26 @@ var _ = Describe("WorkloadAvailabilityConfig controller", Ordered, func() {
 		Eventually(func(g Gomega) {
 			g.Expect(component(getWAC(ctx), v1alpha1.ComponentKeyStorageBasedRemediation).Phase).To(Equal(v1alpha1.ComponentPhaseDegraded))
 		}).Should(Succeed())
+		ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "sbr-finalizing-agent", Namespace: ns,
+			Labels: map[string]string{"app": "sbr-agent", "managed-by": "sbr-operator"}},
+			Spec: appsv1.DaemonSetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "sbr-finalizing-agent"}},
+				Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "sbr-finalizing-agent"}},
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "agent", Image: "example.test/sbr-agent"}}}}}}
+		Expect(k8sClient.Create(ctx, ds)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, getWAC(ctx))).To(Succeed())
+		Eventually(func(g Gomega) {
+			g.Expect(getDeployment(ctx, components.SBR().ManagerDeployment).DeletionTimestamp).NotTo(BeNil())
+			g.Expect(getWAC(ctx).Finalizers).To(ContainElement(Finalizer))
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ds), ds)).To(Succeed())
+			g.Expect(ds.DeletionTimestamp).To(BeNil())
+		}).Should(Succeed())
+		completeManagerDeletion(ctx, components.SBR())
+		Eventually(func(g Gomega) {
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ds), ds)).To(Succeed())
+			g.Expect(ds.DeletionTimestamp).NotTo(BeNil())
+			g.Expect(getWAC(ctx).Finalizers).To(ContainElement(Finalizer))
+		}).Should(Succeed())
+		completeForegroundDeletion(ctx, ds)
 		Eventually(func() bool {
 			return apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: v1alpha1.SingletonName}, &v1alpha1.WorkloadAvailabilityConfig{}))
 		}).Should(BeTrue())

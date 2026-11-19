@@ -244,6 +244,7 @@ func (r *WorkloadAvailabilityConfigReconciler) ensureDisabled(ctx context.Contex
 		return st, err
 	}
 	var skipped []string
+	waitingForManagers := false
 	for i := len(objs) - 1; i >= 0; i-- { // webhooks first, service accounts last
 		o := objs[i]
 		existing := &unstructured.Unstructured{}
@@ -259,9 +260,21 @@ func (r *WorkloadAvailabilityConfigReconciler) ensureDisabled(ctx context.Contex
 			skipped = append(skipped, fmt.Sprintf("%s %s/%s", o.GetKind(), o.GetNamespace(), o.GetName()))
 			continue
 		}
-		if err := r.Delete(ctx, existing); err != nil && !apierrors.IsNotFound(err) {
+		var opts []client.DeleteOption
+		if len(def.AgentDaemonSetSelector) > 0 && o.GetKind() == "Deployment" {
+			// A background delete can leave managers reconciling while their agents
+			// are removed. Keep the Deployment until its ReplicaSets and pods are gone.
+			opts = append(opts, client.PropagationPolicy(metav1.DeletePropagationForeground))
+			waitingForManagers = true
+		}
+		if err := r.Delete(ctx, existing, opts...); err != nil && !apierrors.IsNotFound(err) {
 			return st, fmt.Errorf("delete %s/%s: %w", o.GetKind(), o.GetName(), err)
 		}
+	}
+	if waitingForManagers {
+		st.Phase = v1alpha1.ComponentPhaseProgressing
+		st.Message = "waiting for manager Deployments and pods to terminate before removing agents"
+		return st, nil
 	}
 	if len(def.AgentDaemonSetSelector) > 0 {
 		dsl := &appsv1.DaemonSetList{}
@@ -270,9 +283,16 @@ func (r *WorkloadAvailabilityConfigReconciler) ensureDisabled(ctx context.Contex
 		}
 		for i := range dsl.Items {
 			ds := &dsl.Items[i]
-			if err := r.Delete(ctx, ds); err != nil && !apierrors.IsNotFound(err) {
+			// Foreground deletion preserves the pod termination grace period and keeps
+			// shutdown in progress until dependent agent pods have been removed.
+			if err := r.Delete(ctx, ds, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil && !apierrors.IsNotFound(err) {
 				return st, fmt.Errorf("delete DaemonSet %s/%s: %w", ds.Namespace, ds.Name, err)
 			}
+		}
+		if len(dsl.Items) > 0 {
+			st.Phase = v1alpha1.ComponentPhaseProgressing
+			st.Message = "waiting for agent DaemonSets and pods to terminate"
+			return st, nil
 		}
 	}
 	retained, err := r.retainedResources(ctx, def)
@@ -359,14 +379,19 @@ func (r *WorkloadAvailabilityConfigReconciler) finalize(ctx context.Context, wac
 		return ctrl.Result{}, nil
 	}
 	log := logf.FromContext(ctx)
+	progressing := false
 	for _, def := range components.All() {
 		st, err := r.ensureDisabled(ctx, def)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
+		progressing = progressing || st.Phase == v1alpha1.ComponentPhaseProgressing
 		if len(st.RetainedResources) > 0 {
 			log.Info("config deleted with retained component resources", "component", def.Key, "retained", st.RetainedResources)
 		}
+	}
+	if progressing {
+		return ctrl.Result{RequeueAfter: requeueProgressing}, nil
 	}
 	controllerutil.RemoveFinalizer(wac, Finalizer)
 	return ctrl.Result{}, r.Update(ctx, wac)

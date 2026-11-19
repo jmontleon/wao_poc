@@ -211,7 +211,10 @@ removed, the operand objects it renders (not the OLM-owned RBAC). Specifically:
   regardless, because the CSV owns them (D8).
 - Disabling removes the component's webhook configurations along with the manager. A `Fail` webhook without a backend would block even deleting the component's objects, and WAO never switches a webhook to `Ignore`. While a component is disabled its objects are not validated.
 - Disable is **manager-level**. It removes the component manager and webhooks,
-  and for SNR and SBR also deletes their agent DaemonSets. It does **not** stop
+  and for SNR and SBR also deletes their agent DaemonSets. WAO waits for the
+  manager Deployment and its pods to disappear before deleting agent DaemonSets,
+  then waits for their pods to terminate. These stages report `Progressing` and
+  preserve the pods' termination grace periods. It does **not** stop
   other objects the component created: SNR's default config, template and
   certificate Secret stay, as would SBR's config and storage objects. WAO reports
   this as phase `DisableIncomplete` with the objects listed in `retainedResources`.
