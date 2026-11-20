@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -278,7 +279,8 @@ func (r *WorkloadAvailabilityConfigReconciler) ensureDisabled(ctx context.Contex
 	}
 	if len(def.AgentDaemonSetSelector) > 0 {
 		dsl := &appsv1.DaemonSetList{}
-		if err := r.List(ctx, dsl, client.InNamespace(r.Namespace), client.MatchingLabels(def.AgentDaemonSetSelector)); err != nil {
+		opts := append(r.agentListOptions(def), client.MatchingLabels(def.AgentDaemonSetSelector))
+		if err := r.List(ctx, dsl, opts...); err != nil {
 			return st, err
 		}
 		for i := range dsl.Items {
@@ -318,8 +320,16 @@ func (r *WorkloadAvailabilityConfigReconciler) ensureDisabled(ctx context.Contex
 	return st, nil
 }
 
+// agentListOptions follows the namespace scope supported by the component manager.
+func (r *WorkloadAvailabilityConfigReconciler) agentListOptions(def components.Definition) []client.ListOption {
+	if def.AgentsInAllNamespaces {
+		return nil
+	}
+	return []client.ListOption{client.InNamespace(r.Namespace)}
+}
+
 // retainedResources lists what outlives a manager-level disable: component config CRs
-// (install namespace) with agent DaemonSets still owned by them, plus native objects of the
+// in their supported namespaces with agent DaemonSets still owned by them, plus native objects of the
 // component's managed kinds anywhere in the cluster. SNR/SBR agent DaemonSets are deleted on
 // disable via AgentDaemonSetSelector, so they no longer appear here.
 func (r *WorkloadAvailabilityConfigReconciler) retainedResources(ctx context.Context, def components.Definition) ([]string, error) {
@@ -330,7 +340,7 @@ func (r *WorkloadAvailabilityConfigReconciler) retainedResources(ctx context.Con
 			kinds[a.Kind] = true
 		}
 		dsl := &appsv1.DaemonSetList{}
-		if err := r.List(ctx, dsl, client.InNamespace(r.Namespace)); err != nil {
+		if err := r.List(ctx, dsl, r.agentListOptions(def)...); err != nil {
 			return nil, err
 		}
 		for _, ds := range dsl.Items {
@@ -361,7 +371,7 @@ func (r *WorkloadAvailabilityConfigReconciler) retainedResources(ctx context.Con
 		return nil
 	}
 	for _, a := range def.AgentOwners {
-		if err := list(a, client.InNamespace(r.Namespace)); err != nil {
+		if err := list(a, r.agentListOptions(def)...); err != nil {
 			return nil, err
 		}
 	}
@@ -402,14 +412,25 @@ func (r *WorkloadAvailabilityConfigReconciler) SetupWithManager(mgr ctrl.Manager
 	toSingleton := handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, _ client.Object) []reconcile.Request {
 		return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: v1alpha1.SingletonName}}}
 	})
-	inNamespace := predicate.NewPredicateFuncs(func(o client.Object) bool { return o.GetNamespace() == r.Namespace })
+	inAgentScope := predicate.NewPredicateFuncs(func(o client.Object) bool {
+		if o.GetNamespace() == r.Namespace {
+			return true
+		}
+		for _, def := range components.All() {
+			if def.AgentsInAllNamespaces && len(def.AgentDaemonSetSelector) > 0 &&
+				labels.SelectorFromSet(def.AgentDaemonSetSelector).Matches(labels.Set(o.GetLabels())) {
+				return true
+			}
+		}
+		return false
+	})
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.WorkloadAvailabilityConfig{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Owns(&admissionregistrationv1.ValidatingWebhookConfiguration{}).
 		Owns(&admissionregistrationv1.MutatingWebhookConfiguration{}).
-		Watches(&appsv1.DaemonSet{}, toSingleton, builder.WithPredicates(inNamespace)).
+		Watches(&appsv1.DaemonSet{}, toSingleton, builder.WithPredicates(inAgentScope)).
 		Named("workloadavailabilityconfig").
 		Complete(r)
 }

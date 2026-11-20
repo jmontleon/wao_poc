@@ -214,7 +214,9 @@ removed, the operand objects it renders (not the OLM-owned RBAC). Specifically:
   and for SNR and SBR also deletes their agent DaemonSets. WAO waits for the
   manager Deployment and its pods to disappear before deleting agent DaemonSets,
   then waits for their pods to terminate. These stages report `Progressing` and
-  preserve the pods' termination grace periods. It does **not** stop
+  preserve the pods' termination grace periods. SBR agent cleanup and retained
+  config reporting cover every namespace; SNR remains scoped to the install
+  namespace. It does **not** stop
   other objects the component created: SNR's default config, template and
   certificate Secret stay, as would SBR's config and storage objects. WAO reports
   this as phase `DisableIncomplete` with the objects listed in `retainedResources`.

@@ -13,6 +13,7 @@ func SBR() Definition {
 		Deployments:            []string{"sbr-operator-controller-manager"},
 		Images:                 []string{images.SBRManager, images.SBRAgent},
 		AgentOwners:            []ResourceKind{{Group: "storage-based-remediation.medik8s.io", Version: "v1alpha1", Kind: "StorageBasedRemediationConfig"}},
+		AgentsInAllNamespaces:  true,
 		ManagedKinds:           []ResourceKind{{Group: "storage-based-remediation.medik8s.io", Version: "v1alpha1", Kind: "StorageBasedRemediation"}},
 		AgentDaemonSetSelector: map[string]string{"app": "sbr-agent", "managed-by": "sbr-operator"},
 	}

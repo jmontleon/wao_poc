@@ -638,6 +638,68 @@ var _ = Describe("WorkloadAvailabilityConfig controller", Ordered, func() {
 		Expect(k8sClient.Delete(ctx, cfg)).To(Succeed())
 	})
 
+	It("cleans up SBR agents and reports retained configs in other namespaces", func() {
+		const otherNamespace = "wao-other"
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: otherNamespace}})).To(Succeed())
+		cfg := &unstructured.Unstructured{}
+		cfg.SetGroupVersionKind(schema.GroupVersionKind{Group: "storage-based-remediation.medik8s.io", Version: "v1alpha1", Kind: "StorageBasedRemediationConfig"})
+		cfg.SetName("external-sbr-config")
+		cfg.SetNamespace(otherNamespace)
+		Expect(k8sClient.Create(ctx, cfg)).To(Succeed())
+		setEnabled(ctx, v1alpha1.ComponentKeyStorageBasedRemediation, true)
+		Eventually(func(g Gomega) {
+			g.Expect(component(getWAC(ctx), v1alpha1.ComponentKeyStorageBasedRemediation).Phase).To(Equal(v1alpha1.ComponentPhaseProgressing))
+		}).Should(Succeed())
+		ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "external-sbr-agent", Namespace: otherNamespace,
+			Labels: map[string]string{"app": "sbr-agent", "managed-by": "sbr-operator"},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: cfg.GetAPIVersion(), Kind: cfg.GetKind(),
+				Name: cfg.GetName(), UID: cfg.GetUID(), Controller: ptr.To(true)}}},
+			Spec: appsv1.DaemonSetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "external-sbr-agent"}},
+				Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "external-sbr-agent"}},
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "agent", Image: "example.test/sbr-agent"}}}}}}
+		Expect(k8sClient.Create(ctx, ds)).To(Succeed())
+		foreign := ds.DeepCopy()
+		foreign.ObjectMeta = metav1.ObjectMeta{Name: "unrelated-agent", Namespace: otherNamespace,
+			Labels: map[string]string{"app": "sbr-agent", "managed-by": "another-operator"}}
+		Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
+		snr := ds.DeepCopy()
+		snr.ObjectMeta = metav1.ObjectMeta{Name: "external-snr-agent", Namespace: otherNamespace,
+			Labels: map[string]string{"k8s-app": "self-node-remediation"}}
+		Expect(k8sClient.Create(ctx, snr)).To(Succeed())
+
+		setEnabled(ctx, v1alpha1.ComponentKeyStorageBasedRemediation, false)
+		Eventually(func(g Gomega) {
+			g.Expect(getDeployment(ctx, components.SBR().ManagerDeployment).DeletionTimestamp).NotTo(BeNil())
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ds), ds)).To(Succeed())
+			g.Expect(ds.DeletionTimestamp).To(BeNil(), "external agents must also wait for the manager to stop")
+		}).Should(Succeed())
+		completeManagerDeletion(ctx, components.SBR())
+		Eventually(func(g Gomega) {
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ds), ds)).To(Succeed())
+			g.Expect(ds.DeletionTimestamp).NotTo(BeNil())
+			g.Expect(component(getWAC(ctx), v1alpha1.ComponentKeyStorageBasedRemediation).Phase).To(Equal(v1alpha1.ComponentPhaseProgressing))
+		}).Should(Succeed())
+		// Drain queued reconciles so completing deletion must be observed by the
+		// cross-namespace watch, rather than the 30-second progress poll.
+		Consistently(func() v1alpha1.ComponentPhase {
+			return component(getWAC(ctx), v1alpha1.ComponentKeyStorageBasedRemediation).Phase
+		}, time.Second, 100*time.Millisecond).Should(Equal(v1alpha1.ComponentPhaseProgressing))
+		completeForegroundDeletion(ctx, ds)
+		Eventually(func(g Gomega) {
+			c := component(getWAC(ctx), v1alpha1.ComponentKeyStorageBasedRemediation)
+			g.Expect(c.Phase).To(Equal(v1alpha1.ComponentPhaseDisableIncomplete))
+			g.Expect(c.RetainedResources).To(ContainElement("storage-based-remediation.medik8s.io/v1alpha1 StorageBasedRemediationConfig " + otherNamespace + "/external-sbr-config"))
+			g.Expect(strings.Join(c.RetainedResources, "\n")).NotTo(ContainSubstring("external-sbr-agent"))
+		}).Should(Succeed())
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(cfg), cfg)).To(Succeed(), "native config must be retained")
+		for _, preserved := range []*appsv1.DaemonSet{foreign, snr} {
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(preserved), preserved)).To(Succeed())
+			Expect(preserved.DeletionTimestamp).To(BeNil(), "unrelated agents and SNR outside the install namespace must survive")
+			Expect(k8sClient.Delete(ctx, preserved)).To(Succeed())
+		}
+		Expect(k8sClient.Delete(ctx, cfg)).To(Succeed())
+	})
+
 	It("installs FAR, MDR and NMO with component-isolated selectors", func() {
 		for _, key := range []string{v1alpha1.ComponentKeyFenceAgentsRemediation, v1alpha1.ComponentKeyMachineDeletionRemediation, v1alpha1.ComponentKeyNodeMaintenance} {
 			setEnabled(ctx, key, true)
